@@ -1,50 +1,51 @@
-<# 
-AD Deprovision Audit (DC-auth only)
-PowerShell 5.1 Compatible
-Description:
-- On a Domain Controller, review whether specified user accounts still have authentication activities within a time window.
-- Events: 4768 (Kerberos TGT issued), 4771 (Kerberos pre-auth failed), 4776 (NTLM authentication; success/failure).
-- Per EVTX immediate CSV export; AFTER all per-file exports, optionally create Consolidated and Per-Account Summary.
+<#
+ADUserLogon (DC-auth only) - PowerShell 5.1
 
-Includes:
-- Robust date parsing (YYYY-MM-DD) w/ no exceptions.
-- Enumerates only Archive-Security-*.evtx (strict pattern).
-- Ensures $fileList is always an array.
-- Any line containing "✓" prints in green automatically.
-- DEFAULT CSV OUTPUT FOLDER = script directory (no "out" subfolder).
+Scopes:
+1) Successful authentication = 4768 + 4776(success)
+2) Failed    authentication = 4771 + 4776(failure)
+3) Successful + Failed
+
+CSV columns (fixed order):
+Timestamp, EventID, EventName, Account, ClientAddress, Workstation, StatusText, SourceFile
+
+Behavior:
+- Default CSV folder = script directory (no 'out' subfolder)
+- Only process files named: Archive-Security-YYYY-MM-DD-HH-MM-SS-fff.evtx
+- For "Newest → Oldest", process the Current Security Log first, then archived files (newest→oldest)
+- Even when a file/current log yields 0 rows, export an empty CSV and print green "✓ ... (0 rows)"
+- Strict date input YYYY-MM-DD; End date ENTER = today; future dates and start> end rejected
+- User list is REQUIRED: prompt for absolute path; default = scriptDir\userlist.txt
+
+Notes:
+- 4776 success/failure determined by Status == '0x0' (success); XPath filters by EventID, with split in PowerShell
+- StatusText maps common codes; unknown codes show as Unknown(<hex>)
 #>
 
-# ==========================
-# Utility & Validation
-# ==========================
 $ErrorActionPreference = 'Stop'
 
+# ---------------- Console helpers ----------------
 function Write-Info($msg) {
-    if ($null -ne $msg -and ($msg -match [regex]::Escape("✓"))) {
-        Write-Host "$msg" -ForegroundColor Green
-    } else {
-        Write-Host "$msg"
-    }
+    if ($null -ne $msg -and ($msg -match [regex]::Escape("✓"))) { Write-Host "$msg" -ForegroundColor Green }
+    else { Write-Host "$msg" }
 }
-function Write-Green($msg)    { Write-Host "$msg" -ForegroundColor Green }
-function Write-Red($msg)      { Write-Host "$msg" -ForegroundColor Red }
-function Write-Yellow($msg)   { Write-Host "$msg" -ForegroundColor Yellow }
-function Write-ProgressNote($activity, $status, $percent) {
+function Write-Green($msg){ Write-Host "$msg" -ForegroundColor Green }
+function Write-Red($msg)  { Write-Host "$msg" -ForegroundColor Red }
+function Write-Yellow($msg){ Write-Host "$msg" -ForegroundColor Yellow }
+function Write-ProgressNote($activity,$status,$percent){
     try {
-        if ($percent -ge 0 -and $percent -le 100) {
-            Write-Progress -Activity $activity -Status $status -PercentComplete $percent
-        } else {
-            Write-Progress -Activity $activity -Status $status
-        }
-    } catch { }
+        if ($percent -ge 0 -and $percent -le 100) { Write-Progress -Activity $activity -Status $status -PercentComplete $percent }
+        else { Write-Progress -Activity $activity -Status $status }
+    } catch {}
 }
 
+# ---------------- Privilege check ----------------
 function Test-AdminOrELR {
     try {
         $wi = [Security.Principal.WindowsIdentity]::GetCurrent()
         $wp = New-Object Security.Principal.WindowsPrincipal($wi)
         $isAdmin = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        $elrSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-573')
+        $elrSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-573') # Event Log Readers
         $isELR = $false
         foreach ($g in $wi.Groups) {
             if ($g.Translate([Security.Principal.SecurityIdentifier]).Value -eq $elrSid.Value) { $isELR = $true; break }
@@ -53,389 +54,451 @@ function Test-AdminOrELR {
     } catch { return $false }
 }
 
+# ---------------- Path & date helpers ----------------
 function Prompt-AbsolutePath([string]$prompt, [string]$default) {
     Write-Host $prompt -NoNewline
     $in = Read-Host
     if ([string]::IsNullOrWhiteSpace($in)) { $in = $default }
     $isAbsolute = ($in -match '^[a-zA-Z]:\\') -or ($in -match '^\\\\')
     if (-not $isAbsolute) { throw "Path must be an absolute path: '$in'" }
-    if (-not $in.EndsWith('\')) { $in = $in + '\' }
+    if (-not $in.EndsWith('\')) { $in += '\' }
     return $in
 }
-
-function TryParse-Date([string]$text, [ref]$outDate) {
-    try {
-        $culture = [System.Globalization.CultureInfo]::InvariantCulture
-        $styles  = [System.Globalization.DateTimeStyles]::AssumeLocal
-        $formats = @('yyyy-MM-dd')
-        [datetime]$tmp = [datetime]::MinValue
-        $ok = [DateTime]::TryParseExact($text, $formats, $culture, $styles, [ref]$tmp)
-        if ($ok) { $outDate.Value = $tmp; return $true } else { return $false }
-    } catch { return $false }
+function TryParse-Date([string]$text,[ref]$outDate){
+    try{
+        $culture=[System.Globalization.CultureInfo]::InvariantCulture
+        $styles=[System.Globalization.DateTimeStyles]::AssumeLocal
+        $formats=@('yyyy-MM-dd')
+        [datetime]$tmp=[datetime]::MinValue
+        $ok=[datetime]::TryParseExact($text,$formats,$culture,$styles,[ref]$tmp)
+        if($ok){$outDate.Value=$tmp;return $true}else{return $false}
+    }catch{ return $false }
+}
+function Read-DateStrict([string]$label,[datetime]$defaultDate,[bool]$allowEmptyDefault=$false){
+    while($true){
+        $s=Read-Host $label
+        if($allowEmptyDefault -and [string]::IsNullOrWhiteSpace($s)){ return $defaultDate.Date }
+        [datetime]$o=[datetime]::MinValue
+        if(-not (TryParse-Date $s ([ref]$o))){ Write-Red "Invalid date format. Use YYYY-MM-DD."; continue }
+        $today=(Get-Date).Date
+        if($o.Date -gt $today){ Write-Red "Date cannot be in the future."; continue }
+        return $o.Date
+    }
+}
+function Confirm-StartEnd([datetime]$start,[datetime]$end){
+    if($start -gt $end){ throw "Start date cannot be later than end date." }
 }
 
-function Read-DateStrict([string]$label, [datetime]$defaultDate, [bool]$allowEmptyDefault=$false) {
-    while ($true) {
-        $inputStr = Read-Host $label
-        if ($allowEmptyDefault -and [string]::IsNullOrWhiteSpace($inputStr)) { return $defaultDate.Date }
-        [datetime]$out = [datetime]::MinValue
-        if (-not (TryParse-Date $inputStr ([ref]$out))) { Write-Red "Invalid date format. Use YYYY-MM-DD."; continue }
-        $today = (Get-Date).Date
-        if ($out.Date -gt $today) { Write-Red "Date cannot be in the future."; continue }
-        return $out.Date
+# ---------------- StatusText helper ----------------
+function Get-StatusText([string]$eventId,[string]$statusHex){
+    if([string]::IsNullOrWhiteSpace($statusHex)){ return $null }
+    $hex = $statusHex
+    switch -Regex ($hex){
+        '^0x0$'           { return 'Success' }
+        '^0x18$'          { return 'Bad password' }
+        '^0x12$'          { return 'Account disabled' }
+        '^0x19$'          { return 'No such user' }
+        '^0x23$'          { return 'Password must change' }
+        '^0xC000006A$'    { return 'Username OK, bad password' }
+        '^0xC000006D$'    { return 'Logon failure' }
+        '^0xC000006F$'    { return 'Logon time restriction' }
+        '^0xC0000070$'    { return 'Workstation restriction' }
+        '^0xC0000071$'    { return 'Password expired' }
+        '^0xC0000234$'    { return 'Account locked out' }
+        default           { return "Unknown($hex)" }
     }
 }
 
-function Confirm-StartEnd([datetime]$start, [datetime]$end) {
-    if ($start -gt $end) { throw "Start date cannot be later than end date." }
-}
-
-function Get-EventName([int]$id) {
-    switch ($id) {
-        4768 { 'Kerberos TGT was issued' }
-        4771 { 'Kerberos pre-auth failed' }
-        4776 { 'NTLM authentication' }
-        default { "Event $id" }
+# ---------------- Event mappers ----------------
+function Get-EventName([int]$id){
+    switch($id){
+        4768 {'Kerberos TGT Request'}
+        4771 {'Kerberos PreAuth Failure'}
+        4776 {'NTLM Authentication'}
+        default {"Event $id"}
     }
 }
 
-function Select-EventFields {
+# Extract fields for ADUserLogon CSV
+function Select-LogonFields {
     param([System.Diagnostics.Eventing.Reader.EventRecord]$ev)
-    $id = $ev.Id
-    $timeUtc = $ev.TimeCreated.ToUniversalTime().ToString('o')
-    $eventName = Get-EventName $id
+
+    $id = [int]$ev.Id
+    $tsLocal = $ev.TimeCreated.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
     $xml = [xml]$ev.ToXml()
     $dataNodes = $xml.Event.EventData.Data
-    $getVal = { param($name) foreach ($n in $dataNodes) { if ($n.Name -eq $name) { return [string]$n.'#text' } } return $null }
-    $account = (& $getVal 'TargetUserName'); if (-not $account) { $account = (& $getVal 'AccountName') }
-    $client  = (& $getVal 'IpAddress'); if (-not $client) { $client = (& $getVal 'ClientAddress') }
-    $ws      = (& $getVal 'Workstation'); if (-not $ws) { $ws = (& $getVal 'WorkstationName') }
-    $logonType = (& $getVal 'LogonType')
-    $status = (& $getVal 'Status'); if (-not $status) { $status = (& $getVal 'FailureCode') }; if (-not $status) { $status = (& $getVal 'SubStatus') }
-    if ($id -eq 4768) { $status = 'SUCCESS' }
-    elseif ($id -eq 4771) { if (-not $status) { $status = 'FAILED' } }
-    elseif ($id -eq 4776) { if ($status -and $status.Trim().ToLower() -eq '0x0') { $status = 'SUCCESS' } }
+
+    $getVal = {
+        param($name)
+        foreach ($n in $dataNodes) { if ($n.Name -eq $name) { return [string]$n.'#text' } }
+        return $null
+    }
+
+    # account fields may vary by event
+    $account = (& $getVal 'TargetUserName')
+    if(-not $account){ $account = (& $getVal 'AccountName') }
+    if(-not $account){ $account = (& $getVal 'TargetUserSid') }
+
+    # client / workstation
+    $clientIp = (& $getVal 'IpAddress')
+    if(-not $clientIp){ $clientIp = (& $getVal 'ClientAddress') }
+    $workst   = (& $getVal 'WorkstationName')
+
+    # status code for mapping and 4776 success/fail split
+    $status = (& $getVal 'Status')
+    if(-not $status){ $status = (& $getVal 'FailureCode') } # 4771
+    $statusText = Get-StatusText -eventId $id -statusHex $status
+
     [pscustomobject]@{
-        TimestampUTC    = $timeUtc
-        EventID         = $id
-        EventName       = $eventName
-        Account         = $account
-        ClientAddress   = $client
-        Workstation     = $ws
-        LogonType       = $logonType
-        StatusOrFailure = $status
+        Timestamp    = $tsLocal
+        EventID      = $id
+        EventName    = (Get-EventName $id)
+        Account      = $account
+        ClientAddress= $clientIp
+        Workstation  = $workst
+        StatusText   = $statusText
+        SourceFile   = ''   # set by caller
+        _StatusRaw   = $status # internal (do not export)
     }
 }
 
-function Build-XPath([int[]]$ids, [datetime]$start, [datetime]$end, [string[]]$users) {
-    $startUtc = $start.ToUniversalTime().ToString('o')
-    $endUtc   = $end.AddDays(1).AddMilliseconds(-1).ToUniversalTime().ToString('o')
-    $idPart = ($ids | ForEach-Object { "EventID=$_"} ) -join ' or '
-    $userConds = @()
-    foreach ($u in $users) {
-        $esc = $u.Replace("'", "&apos;")
-        $userConds += "Data[@Name='TargetUserName']='$esc'"
-        $userConds += "Data[@Name='AccountName']='$esc'"
+# ---------------- XPath builder ----------------
+function Build-XPath([int[]]$ids,[datetime]$start,[datetime]$end,[string[]]$users){
+    $startUtc=$start.ToUniversalTime().ToString('o')
+    $endUtc=$end.AddDays(1).AddMilliseconds(-1).ToUniversalTime().ToString('o')
+    $idPart=($ids|ForEach-Object{"EventID=$_"} ) -join ' or '
+    $base="*[System[($idPart) and TimeCreated[@SystemTime>='$startUtc' and @SystemTime<='$endUtc']]]"
+    if($users -and $users.Count -gt 0){
+        $conds=@()
+        foreach($u in $users){
+            $esc=$u.Replace("'","&apos;")
+            $conds+="Data[@Name='TargetUserName']='$esc'"
+            $conds+="Data[@Name='AccountName']='$esc'"
+        }
+        $userPart=($conds -join ' or ')
+        return "$base and *[EventData[($userPart)]]"
     }
-    $userPart = ($userConds | ForEach-Object { $_ }) -join ' or '
-    $xpath = "*[System[($idPart) and TimeCreated[@SystemTime>='$startUtc' and @SystemTime<='$endUtc']]]"
-    if ($userPart) { $xpath += " and *[EventData[($userPart)]]" }
-    return $xpath
+    return $base
 }
 
-function Get-FileTimeWindow([string]$path) {
-    try {
-        $oldest = Get-WinEvent -Path $path -Oldest -MaxEvents 1
-        $newest = Get-WinEvent -Path $path -MaxEvents 1
-        if ($oldest -and $newest) {
+# ---------------- File time window (skip non-overlap) ----------------
+function Get-FileTimeWindow([string]$path){
+    try{
+        $oldest=Get-WinEvent -Path $path -Oldest -MaxEvents 1
+        $newest=Get-WinEvent -Path $path -MaxEvents 1
+        if($oldest -and $newest){
             return [pscustomobject]@{ Path=$path; Start=$oldest.TimeCreated.Date; End=$newest.TimeCreated.Date; Valid=$true }
         }
-    } catch { }
+    }catch{}
     return [pscustomobject]@{ Path=$path; Start=$null; End=$null; Valid=$false }
 }
 
-# ==========================
-# Privilege Check
-# ==========================
+# ---------------- Safe fetch wrapper ----------------
+function Fetch-EventsSafe {
+    param(
+        [ValidateSet('Current','File')][string]$SourceType,
+        [string]$PathIfFile,
+        [string]$XPath
+    )
+    try{
+        if($SourceType -eq 'Current'){
+            $evs = Get-WinEvent -LogName Security -FilterXPath $XPath -ErrorAction Stop
+        } else {
+            $evs = Get-WinEvent -Path $PathIfFile -FilterXPath $XPath -ErrorAction Stop
+        }
+        return [pscustomobject]@{ Events=@($evs); Error=$null }
+    }catch{
+        $msg = $_.Exception.Message
+        if($msg -match 'No events were found that match the specified selection criteria'){
+            return [pscustomobject]@{ Events=@(); Error=$null } # treat as 0 rows (not an error)
+        } else {
+            return [pscustomobject]@{ Events=@(); Error=$_.Exception }
+        }
+    }
+}
+
+# ---------------- Banner & privilege ----------------
 Write-Info "# ======================="
-Write-Info "# AD Deprovision Audit (DC-auth only)"
-Write-Info "# PowerShell 5.1 compatible"
+Write-Info "# AD User Logon Audit (DC-auth only)"
+Write-Info "# PowerShell 5.1"
 Write-Info "# =======================`n"
 
-if (-not (Test-AdminOrELR)) { Write-Red "[Privilege Check] Insufficient privileges. Run as Administrator or a member of 'Event Log Readers'."; exit 1 }
+if(-not (Test-AdminOrELR)){
+    Write-Red "[Privilege Check] Insufficient privileges. Run as Administrator or a member of 'Event Log Readers'."
+    exit 1
+}
 Write-Info "[Privilege Check]"
 Write-Info "✓ You are running with sufficient privileges (Administrators/Event Log Readers).`n"
 
-# ==========================
-# Main Menu - Event Scope
-# ==========================
+# ---------------- Scope menu ----------------
 Write-Info "[Main Menu - Event Scope]"
 Write-Info "1) Successful authentication (4768 + 4776-success)"
-Write-Info "2) Failed authentication (4771 + 4776-failure)"
+Write-Info "2) Failed    authentication (4771 + 4776-failure)"
 Write-Info "3) Successful + Failed"
-$eventChoice = Read-Host "Selection"
-$ids = @()
-switch ($eventChoice) {
-    '1' { $ids = 4768,4776 }
-    '2' { $ids = 4771,4776 }
-    '3' { $ids = 4768,4771,4776 }
+$scopeSel=Read-Host "Selection"
+
+# event sets (query 4776 then split by status)
+[int[]]$idsToQuery=@()
+$want4768=$false; $want4771=$false; $want4776Success=$false; $want4776Failure=$false
+switch($scopeSel){
+    '1' { $idsToQuery=@(4768,4776); $want4768=$true; $want4776Success=$true }
+    '2' { $idsToQuery=@(4771,4776); $want4771=$true; $want4776Failure=$true }
+    '3' { $idsToQuery=@(4768,4771,4776); $want4768=$true; $want4771=$true; $want4776Success=$true; $want4776Failure=$true }
     default { Write-Red "Invalid selection."; exit 1 }
 }
 
-# ==========================
-# User List
-# ==========================
+# ---------------- User list (REQUIRED) ----------------
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $defaultUserList = Join-Path $scriptDir 'userlist.txt'
-try {
-    $pathPrompt = "Enter absolute path to user list (default: $defaultUserList):`n> "
-    Write-Host $pathPrompt -NoNewline
-    $userListPath = Read-Host
-    if ([string]::IsNullOrWhiteSpace($userListPath)) { $userListPath = $defaultUserList }
-    $isAbsolute = ($userListPath -match '^[a-zA-Z]:\\') -or ($userListPath -match '^\\\\')
-    if (-not $isAbsolute) { throw "Path must be an absolute path: '$userListPath'" }
-    if (-not (Test-Path -LiteralPath $userListPath)) { throw "User list not found: $userListPath" }
-    $raw = Get-Content -LiteralPath $userListPath -ErrorAction Stop
-    $users = $raw | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | Select-Object -Unique
-    if (-not $users -or $users.Count -eq 0) { throw "User list is empty." }
-    $display = ($users -join ', ')
-    Write-Info "✓ Loaded accounts: $display`n"
-} catch { Write-Red $_.Exception.Message; exit 1 }
+Write-Info "[User List]"
+Write-Host ("Enter absolute path to user list (default: {0})" -f $defaultUserList)
+Write-Host "> " -NoNewline
+$userListPath = Read-Host
+if([string]::IsNullOrWhiteSpace($userListPath)){ $userListPath = $defaultUserList }
+$isAbs = ($userListPath -match '^[a-zA-Z]:\\') -or ($userListPath -match '^\\\\')
+if(-not $isAbs){ Write-Red "Path must be an absolute path: '$userListPath'"; exit 1 }
+if(-not (Test-Path -LiteralPath $userListPath)){ Write-Red "User list not found: $userListPath"; exit 1 }
+$raw = Get-Content -LiteralPath $userListPath -ErrorAction Stop
+$users = $raw | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique
+if(-not $users -or $users.Count -eq 0){ Write-Red "User list is empty."; exit 1 }
+Write-Info ("✓ Loaded accounts: {0}`n" -f ($users -join ', '))
 
-# ==========================
-# Period
-# ==========================
+# ---------------- Period ----------------
 Write-Info "[Period]"
 Write-Info "1) 1 day   2) 1 week   3) 1 month   4) 1 quarter   5) 1 year   6) Custom range"
-$periodSel = Read-Host "Selection"
-$today = (Get-Date).Date
-switch ($periodSel) {
-    '1' { $startDate = $today.AddDays(-1); $endDate = $today }
-    '2' { $startDate = $today.AddDays(-7); $endDate = $today }
-    '3' { $startDate = $today.AddMonths(-1); $endDate = $today }
-    '4' { $startDate = $today.AddMonths(-3); $endDate = $today }
-    '5' { $startDate = $today.AddYears(-1); $endDate = $today }
-    '6' { $startDate = Read-DateStrict -label "Start date (YYYY-MM-DD)" -defaultDate $today -allowEmptyDefault:$false
-          $endDate   = Read-DateStrict -label "End date   (YYYY-MM-DD) [ENTER = today]" -defaultDate $today -allowEmptyDefault:$true }
+$periodSel=Read-Host "Selection"
+$today=(Get-Date).Date
+switch($periodSel){
+    '1' { $startDate=$today.AddDays(-1); $endDate=$today }
+    '2' { $startDate=$today.AddDays(-7); $endDate=$today }
+    '3' { $startDate=$today.AddMonths(-1); $endDate=$today }
+    '4' { $startDate=$today.AddMonths(-3); $endDate=$today }
+    '5' { $startDate=$today.AddYears(-1); $endDate=$today }
+    '6' { $startDate=Read-DateStrict -label "Start date (YYYY-MM-DD)" -defaultDate $today -allowEmptyDefault:$false
+          $endDate  =Read-DateStrict -label "End date   (YYYY-MM-DD) [ENTER = today]" -defaultDate $today -allowEmptyDefault:$true }
     default { Write-Red "Invalid selection."; exit 1 }
 }
-try { Confirm-StartEnd $startDate $endDate } catch { Write-Red $_.Exception.Message; exit 1 }
+try{ Confirm-StartEnd $startDate $endDate }catch{ Write-Red $_.Exception.Message; exit 1 }
 Write-Info "✓ Parsed range: $($startDate.ToString('yyyy-MM-dd')) ~ $($endDate.ToString('yyyy-MM-dd')) (inclusive)`n"
 
-# ==========================
-# Log Sources
-# ==========================
+# ---------------- Log sources ----------------
 Write-Info "[Log Sources]"
 Write-Info "1) Current Security log only"
 Write-Info "2) Current Security + Archived EVTX"
-$logSel = Read-Host "Selection"
+$logSel=Read-Host "Selection"
 
-$evtxFiles = @()
-$coverageStart = $null
-$coverageEnd   = $null
-$fileList = @()
+$fileList=@()
+$processCurrentFirst=$false
 
-if ($logSel -eq '2') {
-    try {
-        $defaultArchive = $scriptDir
-        $folder = Prompt-AbsolutePath "Archived EVTX folder (absolute path; default = script directory):`n> " $defaultArchive
-        if (-not (Test-Path -LiteralPath $folder)) { throw "Folder not found: $folder" }
-
-        $allCandidates = Get-ChildItem -LiteralPath $folder -Filter 'Archive-Security-*.evtx' -File -ErrorAction Stop
-        $pattern = '^Archive-Security-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-\d{3}\.evtx$'
-        $archCandidates = $allCandidates | Where-Object { $_.Name -match $pattern }
+if($logSel -eq '2'){
+    try{
+        $defaultArchive=$scriptDir
+        $folder=Prompt-AbsolutePath "Archived EVTX folder (absolute path; default = script directory):`n> " $defaultArchive
+        if(-not (Test-Path -LiteralPath $folder)){ throw "Folder not found: $folder" }
+        $allCandidates=Get-ChildItem -LiteralPath $folder -Filter 'Archive-Security-*.evtx' -File -ErrorAction Stop
+        $pattern='^Archive-Security-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-\d{3}\.evtx$'
+        $archCandidates=$allCandidates | Where-Object { $_.Name -match $pattern }
         Write-Info "✓ Discovered $($archCandidates.Count) Archive-Security-*.evtx files"
 
-        $windows = @()
-        foreach ($fItem in $archCandidates) {
-            $w = Get-FileTimeWindow -path $fItem.FullName
-            if ($w.Valid) { $windows += $w }
+        # coverage & overlap
+        $windows=@()
+        foreach($fItem in $archCandidates){
+            $w=Get-FileTimeWindow -path $fItem.FullName
+            if($w.Valid){ $windows+=$w }
         }
-        $overlap = $windows | Where-Object { $_.Start -le $endDate -and $_.End -ge $startDate }
-
-        if ($overlap.Count -gt 0) {
-            $coverageStart = ($overlap | Measure-Object -Property Start -Minimum).Minimum
-            $coverageEnd   = ($overlap | Measure-Object -Property End   -Maximum).Maximum
-            Write-Info "✓ Actual searchable coverage: $($coverageStart.ToString('yyyy-MM-dd')) ~ $($coverageEnd.ToString('yyyy-MM-dd'))"
-        } else { Write-Yellow "No archived files overlap the requested range." }
+        $overlap=$windows | Where-Object { $_.Start -le $endDate -and $_.End -ge $startDate }
+        if($overlap.Count -gt 0){
+            $covStart=($overlap|Measure-Object -Property Start -Minimum).Minimum
+            $covEnd  =($overlap|Measure-Object -Property End   -Maximum).Maximum
+            Write-Info "✓ Actual searchable coverage: $($covStart.ToString('yyyy-MM-dd')) ~ $($covEnd.ToString('yyyy-MM-dd'))"
+        }else{ Write-Yellow "No archived files overlap the requested range." }
 
         Write-Info "Process order:"
         Write-Info "1) Oldest → Newest"
-        Write-Info "2) Newest → Oldest"
-        $order = Read-Host "Selection"
-        switch ($order) {
-            '1' { $fileList = @($overlap | Sort-Object Start | Select-Object -ExpandProperty Path) }
-            '2' { $fileList = @($overlap | Sort-Object End -Descending | Select-Object -ExpandProperty Path) }
+        Write-Info "2) Newest → Oldest  (Current log will be processed FIRST)"
+        $order=Read-Host "Selection"
+        switch($order){
+            '1' { $fileList=@($overlap | Sort-Object Start | Select-Object -ExpandProperty Path); $processCurrentFirst=$false }
+            '2' { $fileList=@($overlap | Sort-Object End -Descending | Select-Object -ExpandProperty Path); $processCurrentFirst=$true }
             default { Write-Red "Invalid selection."; exit 1 }
         }
-        if ($fileList -is [string]) { $fileList = @($fileList) }
-    } catch { Write-Red $_.Exception.Message; exit 1 }
-} elseif ($logSel -eq '1') {
-    # no archived files
-} else { Write-Red "Invalid selection."; exit 1 }
+        if($fileList -is [string]){ $fileList=@($fileList) }
+    }catch{ Write-Red $_.Exception.Message; exit 1 }
+}elseif($logSel -eq '1'){
+    $processCurrentFirst=$true
+}else{
+    Write-Red "Invalid selection."; exit 1
+}
 Write-Host ""
 
-# ==========================
-# Export Settings (per-file)
-# ==========================
-try {
-    $defaultOut = $scriptDir   # <--- default equals script directory (no 'out' subfolder)
-    $outFolder = Prompt-AbsolutePath "CSV output folder (absolute path; default = $defaultOut):`n> " $defaultOut
-    if (-not (Test-Path -LiteralPath $outFolder)) {
-        New-Item -ItemType Directory -Path $outFolder -Force | Out-Null
-    }
+# ---------------- Export settings ----------------
+try{
+    $defaultOut=$scriptDir
+    $outFolder=Prompt-AbsolutePath "CSV output folder (absolute path; default = $defaultOut):`n> " $defaultOut
+    if(-not (Test-Path -LiteralPath $outFolder)){ New-Item -ItemType Directory -Path $outFolder -Force | Out-Null }
     Write-Info "✓ Per-file export is enabled. File naming:"
     Write-Info "  - Archived EVTX → ADUserLogon-<yyyyMMdd>-<index>.csv"
     Write-Info "  - Current       → ADUserLogon-Current-<yyyyMMdd-HHmmss>.csv"
     Write-Host ""
-} catch { Write-Red $_.Exception.Message; exit 1 }
+}catch{ Write-Red $_.Exception.Message; exit 1 }
 
-# ==========================
-# Query Builder
-# ==========================
+# ---------------- Build query ----------------
 $users = $users | Select-Object -Unique
-$xpath = Build-XPath -ids $ids -start $startDate -end $endDate -users $users
+$xpath = Build-XPath -ids $idsToQuery -start $startDate -end $endDate -users $users
 
-function Fetch-EventsFromSource {
-    param([string]$SourceType,[string]$PathIfFile,[string]$XPath)
-    if ($SourceType -eq 'Current') { return Get-WinEvent -LogName Security -FilterXPath $XPath -ErrorAction Stop }
-    else { return Get-WinEvent -Path $PathIfFile -FilterXPath $XPath -ErrorAction Stop }
+# ---------------- Filters by scope (after fetch) ----------------
+function Match-Scope {
+    param(
+        [pscustomobject]$Row,
+        [bool]$want4768,[bool]$want4771,[bool]$want476Success,[bool]$want476Failure
+    )
+    switch([int]$Row.EventID){
+        4768 { return $want4768 } # success
+        4771 { return $want4771 } # failure
+        4776 {
+            $s = ($Row._StatusRaw)
+            if([string]::IsNullOrWhiteSpace($s)){ return $true } # rare; treat as included
+            if($s -eq '0x0'){ return $want476Success } else { return $want476Failure }
+        }
+        default { return $false }
+    }
 }
 
-# ==========================
-# Process Archived Files (per-file export)
-# ==========================
-$totalCount = 0
-$index = 0
-$consolidatedBuffer = @()
+# ---------------- Core processors ----------------
+function Export-Rows {
+    param([pscustomobject[]]$Rows,[string]$OutPath)
+    $Rows | Select-Object Timestamp,EventID,EventName,Account,ClientAddress,Workstation,StatusText,SourceFile |
+        Export-Csv -LiteralPath $OutPath -NoTypeInformation -Encoding UTF8
+}
 
-if ($fileList -and $fileList.Count -gt 0) {
-    $totalFiles = $fileList.Count
-    for ($i=0; $i -lt $totalFiles; $i++) {
-        $index = $i + 1
-        $f = $fileList[$i]
-        $fileShort = [System.IO.Path]::GetFileName($f)
-        $label = "[Processing $index/$totalFiles]  $fileShort"
+function Process-ArchivedFiles {
+    param([string[]]$Files,[string]$XPath,[string]$OutFolder,
+          [bool]$want4768,[bool]$want4771,[bool]$want476Success,[bool]$want476Failure,
+          [ref]$GrandTotal,[ref]$Consolidated)
+
+    if(-not $Files -or $Files.Count -eq 0){ return }
+
+    $totalFiles=$Files.Count
+    for($i=0;$i -lt $totalFiles;$i++){
+        $idx=$i+1
+        $f=$Files[$i]
+        $fileShort=[System.IO.Path]::GetFileName($f)
+        $label="[Processing $idx/$totalFiles]  $fileShort"
         Write-ProgressNote -activity $label -status "Scanning..." -percent 5
-        $found = @()
-        try {
-            $events = Fetch-EventsFromSource -SourceType 'File' -PathIfFile $f -XPath $xpath
-            $cnt = 0
-            foreach ($ev in $events) {
-                $cnt++
-                if ($cnt % 50 -eq 0) { $pct = [math]::Min(95, [int](5 + ($cnt % 1000)/10)); Write-ProgressNote -activity $label -status "Scanning... ($cnt events matched)" -percent $pct }
-                $row = Select-EventFields -ev $ev
-                $sourceTag = ("Archive-{0}-{1}" -f ($row.TimestampUTC.Substring(0,10).Replace('-','')), $index)
-                $row | Add-Member -NotePropertyName Source -NotePropertyValue $sourceTag
-                $row | Add-Member -NotePropertyName SourceFile -NotePropertyValue $fileShort
-                $consolidatedBuffer += $row
+
+        $found=@()
+        $fetch = Fetch-EventsSafe -SourceType 'File' -PathIfFile $f -XPath $XPath
+        if($fetch.Error){
+            Write-Red ("Error reading file: {0} - {1}" -f $f, $fetch.Error.Message)
+            Write-Progress -Activity $label -Completed
+            continue
+        }
+
+        $cnt=0
+        foreach($ev in $fetch.Events){
+            $cnt++
+            if($cnt % 80 -eq 0){ $pct=[math]::Min(95,[int](5+($cnt%1600)/16)); Write-ProgressNote -activity $label -status "Scanning... ($cnt events read)" -percent $pct }
+            $row=Select-LogonFields -ev $ev
+            if( Match-Scope -Row $row -want4768:$want4768 -want4771:$want4771 -want476Success:$want476Success -want476Failure:$want476Failure ){
+                $row.SourceFile = $fileShort
                 $found += $row
-            }
-            Write-ProgressNote -activity $label -status "Finalizing..." -percent 100
-        } catch { Write-Red "Error reading file: $f - $($_.Exception.Message)"; continue }
-        finally { Write-Progress -Activity $label -Completed }
-
-        $count = $found.Count
-        if ($count -gt 0) { Write-Green ("[########################################] 100% Done          Total: {0} √" -f $count) }
-        else { Write-Info ("[########################################] 100% Done          Total: {0} √" -f $count) }
-
-        $dateTag = (Get-Item -LiteralPath $f).LastWriteTime.ToString('yyyyMMdd')
-        $outFile = Join-Path $outFolder ("ADUserLogon-{0}-{1}.csv" -f $dateTag, $index)
-        try { $found | Export-Csv -LiteralPath $outFile -NoTypeInformation -Encoding UTF8; Write-Info "→ Exporting CSV..."; Write-Info "✓ $outFile  ($count rows)`n" }
-        catch { Write-Red "Failed to export CSV for $f - $($_.Exception.Message)" }
-        $totalCount += $count
-    }
-}
-
-# ==========================
-# Process Current Security Log (per-file export)
-# ==========================
-Write-Info "[Processing Current Security Log]"
-$labelCur = "[Processing Current Security Log]"
-Write-ProgressNote -activity $labelCur -status "Scanning..." -percent 5
-$currentFound = @()
-try {
-    $evs = Fetch-EventsFromSource -SourceType 'Current' -XPath $xpath
-    $cnt = 0
-    foreach ($ev in $evs) {
-        $cnt++
-        if ($cnt % 100 -eq 0) { $pct = [math]::Min(95, [int](5 + ($cnt % 2000)/20)); Write-ProgressNote -activity $labelCur -status "Scanning... ($cnt events matched)" -percent $pct }
-        $row = Select-EventFields -ev $ev
-        $row | Add-Member -NotePropertyName Source -NotePropertyValue ("Current-{0}" -f (Get-Date).ToString('yyyyMMdd-HHmmss'))
-        $row | Add-Member -NotePropertyName SourceFile -NotePropertyValue 'CurrentLog'
-        $consolidatedBuffer += $row
-        $currentFound += $row
-    }
-    Write-ProgressNote -activity $labelCur -status "Finalizing..." -percent 100
-} catch { Write-Red "Error reading current Security log: $($_.Exception.Message)" }
-finally { Write-Progress -Activity $labelCur -Completed }
-
-$curCount = $currentFound.Count
-if ($curCount -gt 0) { Write-Green ("[########################################] 100% Done          Total: {0} √" -f $curCount) }
-else { Write-Info ("[########################################] 100% Done          Total: {0} √" -f $curCount) }
-
-$curName = "ADUserLogon-Current-{0}.csv" -f (Get-Date).ToString('yyyyMMdd-HHmmss')
-$curOut = Join-Path $outFolder $curName
-try { $currentFound | Export-Csv -LiteralPath $curOut -NoTypeInformation -Encoding UTF8; Write-Info "→ Exporting CSV..."; Write-Info "✓ $curOut  ($curCount rows)`n" }
-catch { Write-Red "Failed to export CSV for current log - $($_.Exception.Message)" }
-
-# ==========================
-# Post-Export Choices (Consolidated / Account Summary)
-# ==========================
-$grandTotal = $totalCount + $curCount
-Write-Info "Per-file exports completed."
-Write-Info ("Grand total (archived + current): {0}" -f $grandTotal)
-$ansCons = (Read-Host "Also create consolidated CSV at the end? (Y/N)").Trim().ToUpper()
-$ansAcct = (Read-Host "Also create per-account summary CSV? (Y/N)").Trim().ToUpper()
-
-if ($ansCons -eq 'Y') {
-    try {
-        $consName = "ADUserLogon-Consolidated-{0}.csv" -f (Get-Date).ToString('yyyyMMdd-HHmmss')
-        $consOut = Join-Path $outFolder $consName
-        $consolidatedBuffer | Export-Csv -LiteralPath $consOut -NoTypeInformation -Encoding UTF8
-        Write-Info "[Consolidated Export]"
-        Write-Info "✓ $consOut  (Total rows: $($consolidatedBuffer.Count))"
-    } catch { Write-Red "Failed to export consolidated CSV - $($_.Exception.Message)" }
-}
-
-if ($ansAcct -eq 'Y') {
-    Write-Info "[Per-Account Summary]"
-    try {
-        $src = $consolidatedBuffer
-        $rows = @()
-        if ($src.Count -gt 0) {
-            $groups = $src | Group-Object -Property Account
-            foreach ($g in $groups) {
-                $acc = $g.Name; $success = 0; $fail = 0; $lastUtc = $null; $lastId = $null; $lastSt = $null
-                foreach ($r in $g.Group) {
-                    $isSuccess = $false
-                    if     ($r.EventID -eq 4768) { $isSuccess = $true }
-                    elseif ($r.EventID -eq 4771) { $isSuccess = $false }
-                    elseif ($r.EventID -eq 4776) { $st = if ($r.StatusOrFailure) { $r.StatusOrFailure.ToString().Trim().ToLower() } else { '' }; if ($st -eq 'success' -or $st -eq '0x0') { $isSuccess = $true } }
-                    if ($isSuccess) { $success++ } else { $fail++ }
-                    $ts = [datetime]::Parse($r.TimestampUTC)
-                    if (-not $lastUtc -or $ts -gt $lastUtc) { $lastUtc = $ts; $lastId  = $r.EventID; $lastSt = $r.StatusOrFailure }
-                }
-                $rows += [pscustomobject]@{
-                    Account          = $acc
-                    SuccessCount     = $success
-                    FailCount        = $fail
-                    LastSeenUTC      = if ($lastUtc) { $lastUtc.ToString('o') } else { $null }
-                    LastSeenEventID  = $lastId
-                    LastSeenStatus   = $lastSt
-                }
+                $Consolidated.Value += $row
             }
         }
-        $sumName = "ADUserLogon-AccountSummary-{0}.csv" -f (Get-Date).ToString('yyyyMMdd-HHmmss')
-        $sumOut = Join-Path $outFolder $sumName
-        $rows | Sort-Object -Property Account | Export-Csv -LiteralPath $sumOut -NoTypeInformation -Encoding UTF8
-        Write-Info "✓ $sumOut"
-    } catch { Write-Red "Failed to build account summary - $($_.Exception.Message)" }
+        Write-ProgressNote -activity $label -status "Finalizing..." -percent 100
+        Write-Progress -Activity $label -Completed
+
+        $count=$found.Count
+        if($count -gt 0){ Write-Green ("[########################################] 100% Done          Total: {0} √" -f $count) }
+        else{ Write-Info  ("[########################################] 100% Done          Total: {0} √" -f $count) }
+
+        $dateTag=(Get-Item -LiteralPath $f).LastWriteTime.ToString('yyyyMMdd')
+        $outFile=Join-Path $OutFolder ("ADUserLogon-{0}-{1}.csv" -f $dateTag,$idx)
+        try{
+            Export-Rows -Rows $found -OutPath $outFile
+            Write-Green "✓ $outFile  ($count rows)`n"
+        }catch{ Write-Red "Failed to export CSV for $f - $($_.Exception.Message)" }
+        $GrandTotal.Value += $count
+    }
 }
 
-# ==========================
-# Final Summary
-# ==========================
+function Process-CurrentLog {
+    param([string]$XPath,[string]$OutFolder,
+          [bool]$want4768,[bool]$want4771,[bool]$want476Success,[bool]$want476Failure,
+          [ref]$GrandTotal,[ref]$Consolidated)
+
+    Write-Info "[Processing Current Security Log]"
+    $labelCur="[Processing Current Security Log]"
+    Write-ProgressNote -activity $labelCur -status "Scanning..." -percent 5
+
+    $currentFound=@()
+    $fetchCur = Fetch-EventsSafe -SourceType 'Current' -XPath $XPath
+    if($fetchCur.Error){
+        Write-Red ("Error reading current Security log: {0}" -f $fetchCur.Error.Message)
+    }else{
+        $cnt=0
+        foreach($ev in $fetchCur.Events){
+            $cnt++
+            if($cnt % 120 -eq 0){ $pct=[math]::Min(95,[int](5+($cnt%2400)/24)); Write-ProgressNote -activity $labelCur -status "Scanning... ($cnt events read)" -percent $pct }
+            $row=Select-LogonFields -ev $ev
+            if( Match-Scope -Row $row -want4768:$want4768 -want4771:$want4771 -want476Success:$want476Success -want476Failure:$want4776Failure ){
+                $row.SourceFile='CurrentLog'
+                $currentFound += $row
+                $Consolidated.Value += $row
+            }
+        }
+    }
+    Write-ProgressNote -activity $labelCur -status "Finalizing..." -percent 100
+    Write-Progress -Activity $labelCur -Completed
+
+    $curCount=$currentFound.Count
+    if($curCount -gt 0){ Write-Green ("[########################################] 100% Done          Total: {0} √" -f $curCount) }
+    else{ Write-Info  ("[########################################] 100% Done          Total: {0} √" -f $curCount) }
+
+    $curName="ADUserLogon-Current-{0}.csv" -f (Get-Date).ToString('yyyyMMdd-HHmmss')
+    $curOut=Join-Path $OutFolder $curName
+    try{
+        Export-Rows -Rows $currentFound -OutPath $curOut
+        Write-Green "✓ $curOut  ($curCount rows)`n"
+    }catch{ Write-Red "Failed to export CSV for current log - $($_.Exception.Message)" }
+
+    $GrandTotal.Value += $curCount
+}
+
+# ---------------- Run with order rules ----------------
+$totalCount=0
+$consolidated=@()
+
+if($logSel -eq '1'){
+    Process-CurrentLog -XPath $xpath -OutFolder $outFolder -want4768:$want4768 -want4771:$want4771 -want476Success:$want4776Success -want476Failure:$want4776Failure -GrandTotal ([ref]$totalCount) -Consolidated ([ref]$consolidated)
+}else{
+    if($processCurrentFirst){
+        # Newest → Oldest: current first, then archived (already sorted newest→oldest)
+        Process-CurrentLog    -XPath $xpath -OutFolder $outFolder -want4768:$want4768 -want4771:$want4771 -want476Success:$want4776Success -want476Failure:$want4776Failure -GrandTotal ([ref]$totalCount) -Consolidated ([ref]$consolidated)
+        Process-ArchivedFiles -Files $fileList -XPath $xpath -OutFolder $outFolder -want4768:$want4768 -want4771:$want4771 -want476Success:$want4776Success -want476Failure:$want4776Failure -GrandTotal ([ref]$totalCount) -Consolidated ([ref]$consolidated)
+    }else{
+        # Oldest → Newest: archived first, then current
+        Process-ArchivedFiles -Files $fileList -XPath $xpath -OutFolder $outFolder -want4768:$want4768 -want4771:$want4771 -want476Success:$want4776Success -want476Failure:$want4776Failure -GrandTotal ([ref]$totalCount) -Consolidated ([ref]$consolidated)
+        Process-CurrentLog    -XPath $xpath -OutFolder $outFolder -want4768:$want4768 -want4771:$want4771 -want476Success:$want4776Success -want476Failure:$want4776Failure -GrandTotal ([ref]$totalCount) -Consolidated ([ref]$consolidated)
+    }
+}
+
+# ---------------- Optional consolidated ----------------
+Write-Info "Per-file exports completed."
+Write-Info ("Grand total (archived + current): {0}" -f $totalCount)
+$ansCons=(Read-Host "Also create consolidated CSV at the end? (Y/N)").Trim().ToUpper()
+
+if($ansCons -eq 'Y'){
+    try{
+        $consName="ADUserLogon-Consolidated-{0}.csv" -f (Get-Date).ToString('yyyyMMdd-HHmmss')
+        $consOut=Join-Path $outFolder $consName
+        $consolidated | Select-Object Timestamp,EventID,EventName,Account,ClientAddress,Workstation,StatusText,SourceFile |
+            Export-Csv -LiteralPath $consOut -NoTypeInformation -Encoding UTF8
+        Write-Info "[Consolidated Export]"
+        Write-Info "✓ $consOut  (Total rows: $($consolidated.Count))"
+    }catch{ Write-Red "Failed to export consolidated CSV - $($_.Exception.Message)" }
+}
+
 Write-Info ""
 Write-Info "Summary per file completed."
-Write-Info ("Total records across archived + current: {0}" -f $grandTotal)
+Write-Info ("Total records across archived + current: {0}" -f $totalCount)
